@@ -8,4 +8,5 @@ Simulation codes in Simulations folder:
   -- Code for Figure S5, S8, and S9: Exponential_Results (Large).Rmd
   -- Code for Figure S6, S7, and S10-S13: Censoring_Results (Large).Rmd  
 
+
 R script to process genomic study application: https://github.com/QingxiaCindyChen/survival_gwas.git
