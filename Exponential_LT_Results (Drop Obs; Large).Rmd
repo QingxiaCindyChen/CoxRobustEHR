@@ -1,0 +1,1333 @@
+---
+title: "Various Simulations to Compare Cox Regression and Logistic Regression - Exponential (Left Truncation)"
+author: "Rebecca Irlmeier<br><small>Department of Biostatistics<br>Vanderbilt University School of Medicine</small>"
+date: "<small>`r Sys.Date()`</small>"
+output:
+  html_document:
+    toc: no
+    toc_depth: 3
+    number_sections: false
+    toc_float: 
+      collapsed: false
+    code_folding: hide
+    theme: cosmo
+description: "Various Simulations"
+---
+
+```{r warning = FALSE, message = FALSE}
+library(Rlab)
+library(survival)
+library(survminer)
+library(knitr)
+library(actuar)
+library(logistf)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(splines)
+library(gtable)
+library(cowplot)
+library(grid)
+library(grDevices)
+```
+
+## Simulations
+
+There are two different simulations that are explored in this report.
+
+1. The delayed error time is added to the event time only, and the observed time with error is the minimum of the true event time plus error and the true censoring time: $\tilde{T}_{obs}=min(T_e+\epsilon,T_c)$
+2. The delayed error time is added to both $T_e$ and $T_c$ to obtain the observed time with error: $\bar{T}_{obs}=min(T_e-\epsilon, T_c-\epsilon)$
+
+## Error Scenarios
+
+There are five different error scenarios that are generated in this simulation, which can be specified by the input variable *error*:
+
+* error = 0 or error = "none": there is no error term
+* error = 1 or error = "ind" : error term is independent of the covariates
+* error = 2 or error = "z" : error term depends on the binary exposure $z$
+* error = 3 or error = "x1" : error term depends on the binary covariate $x_1$ (confounder)
+* error = 4 or error = "x2" : error term depends on the continuous covariate $x_2$
+
+## Results {.tabset .tabset-fade}
+
+### Simulation 1 - Exponential, large
+
+**Functions**
+
+* The event time is simulated from an Exponential distribution
+* The parameters lead to a large number of observations in Error Case 2
+
+```{r functions-1, warning = FALSE, message = FALSE}
+# Generate data
+survdata <- function(seed, n, error, p1, mu, sd, alpha_vec, beta_1, beta_vec, lambda) {
+  set.seed(seed) # Set seed
+  
+  x1 <- rbern(n, p1) # Generate x1 (confounder)
+  x2 <- rnorm(n, mu, sd) # Generate x2
+  z <- rbern(n, 1/(1 + exp(-alpha_vec[1] - alpha_vec[2]*x1))) # Generate z (exposure)
+  
+  # Generate error term for five scenarios
+    # No error
+  if (error == 0 | error == "none") {
+    error_time <- rep(0, n)
+    # Error independent
+  } else if (error == 1 | error == "ind") {
+    error_time <- runif(n, min = 20, max = 800)
+    # Error depends on z
+  } else if (error == 2 | error == "z") {
+    error_time <- ifelse(z == 1, runif(n, min = 60, max = 100), runif(n, min = 100, max = 1400))
+    # Error depends on x1 (confounder)
+  } else if (error == 3 | error == "x1") {
+    error_time <- ifelse(x1 == 1, runif(n, min = 60, max = 100), runif(n, min = 100, max = 1400))
+    # Error depends on x2
+  } else if (error == 4 | error == "x2") {
+    error_time <- rlnorm(n, meanlog = 10*x2, sdlog = 1)
+    # Invalid input
+  } else {
+    print("Invalid input for err")
+  }
+  
+  time_left_trunc <- runif(n, min = 50, max = 150)   # Left truncation time
+  time_event_pre <- (-log(runif(n, min = 0, max = 1)))*exp(-beta_1*z - beta_vec[1]*x1 - beta_vec[2]*x2)/lambda # Simulated event time from Cox-Exp
+  time_error_pre <- time_event_pre + error_time # Add simulated error time to original time
+  time_censor <- runif(n, min = 430, max = 500) # Censoring time
+  
+  data <- data.frame(cbind(x1, x2, z, time_left_trunc, time_event_pre, time_error_pre, time_censor))  
+  
+  # data$event <- ifelse(data$time_event_pre > data$time_censor | data$time_event_pre < data$time_left_trunc, 0, 1) # Event indicator for original time
+  # data$time_event <- ifelse(data$event == 1, data$time_event_pre, data$time_censor) # Actual time with event
+  # data$event_error <- ifelse(data$time_error_pre > data$time_censor | data$time_error_pre < data$time_left_trunc, 0, 1) # Event indicator for original + error time
+  # data$time_error <- ifelse(data$event_error == 1, data$time_error_pre, data$time_censor) # Actual time with event + error
+  
+  data$event <- ifelse(data$time_event_pre <= data$time_censor, 1, 0) # Event indicator for original time
+  data$time_event <- ifelse(data$event == 1, data$time_event_pre, data$time_censor) # Actual time with event
+  data$event_error <- ifelse(data$time_error_pre <= data$time_censor, 1, 0) # Event indicator for original + error time
+  data$time_error <- ifelse(data$event_error == 1, data$time_error_pre, data$time_censor) # Actual time with event + error
+  
+  # Drop observations with left truncation time greater than observed time
+  error_case4 <- data %>% filter(time_error < time_left_trunc)
+  data <- data[data$time_left_trunc < data$time_error, ]
+ 
+  data$time_diff <- data$time_error - data$time_left_trunc
+  data$rec_len <- data$time_censor - data$time_left_trunc
+  
+  # Get data from the different scenarios of error
+  error_case1 <- data %>% filter(event_error == 0) %>% filter(time_censor < time_event_pre)
+  error_case2 <- data %>% filter(event_error == 0) %>% filter(time_event_pre < time_censor & time_censor < time_error_pre)
+  error_case3 <- data %>% filter(event_error == 1) %>% filter(time_censor > time_error_pre)
+  
+  data.list <- list(data, error_case1, error_case2, error_case3, error_case4)
+  return(data.list)
+}
+
+# Fit Coxph and logistic models on data
+models <- function(data.list){
+  data <- data.list[[1]]
+  # Coxph model
+  m1 <- coxph(Surv(time_left_trunc, time_error, event_error) ~ z + x1 + x2, data = data, timefix = FALSE) # Fit cox model
+  a <- summary(m1) # Model summary
+  
+  reject1 <- ifelse(a$coefficients["z", "Pr(>|z|)"] < 0.05, 1, 0) # Reject p-value
+  beta_est <- a$coefficients["z","coef"] # Beta estimate for z
+  CI_lw <- log(a$conf.int["z", "lower .95"]) # Lower bound of CI for beta for z
+  CI_up <- log(a$conf.int["z", "upper .95"]) # Upper bound of CI for beta for z
+
+  # logistic model adjusting for time
+  m2 <- glm(event_error ~ z + x1 + x2 + ns(time_diff, df=3), data = data, family = binomial()) # Fit logistic model
+  b <- summary(m2) # Model summary
+  reject2 <- ifelse(b$coefficients["z","Pr(>|z|)"] < 0.05, 1, 0) # Reject p-value
+  
+  # logistic model without time
+  m3 <- glm(event_error ~ z + x1 + x2, data = data, family = binomial()) # Fit logistic model
+  c <- summary(m3) # Model summary
+  reject3 <- ifelse(c$coefficients["z","Pr(>|z|)"] < 0.05, 1, 0) # Reject p-value
+  
+  # logistic model adjusting for record length
+  m4 <- glm(event_error ~ z + x1 + x2 + rec_len + ns(time_censor, df=3), data = data, family = binomial()) # Fit logistic model
+  d <- summary(m4) # Model summary
+  reject4 <- ifelse(d$coefficients["z","Pr(>|z|)"] < 0.05, 1, 0) # Reject p-value
+  
+  event_rate <- sum(data$event)/dim(data)[1] # Event rate
+  mean_z <- mean(data$z) # Mean exposure
+  result <- c(mean_z, event_rate, beta_est, CI_lw, CI_up, reject1, reject2, reject3, reject4) # Results
+  return(result)
+}
+
+# Loop
+meanloop <- function(seed, n, error, p1, mu, sd, alpha_vec, beta_1, beta_vec, lambda, loopnum) {
+  results_all <- matrix(NA, loopnum, 9) # Initialize 
+  # Generate data and store results loopnum times
+  for (i in 1:loopnum) {
+    data.list <- survdata(seed + i, n, error, p1, mu, sd, alpha_vec, beta_1, beta_vec, lambda)
+    results_all[i, ] <- models(data.list)
+  }
+  return(results_all)
+}
+
+# Output
+output <- function(seed, n, error, p1, mu, sd, alpha_vec, beta_1, beta_vec, lambda, loopnum) {
+  result <- matrix(NA, 0, 9)
+  for (i in seq_along(beta_1)) {
+    output <- meanloop(seed=seed, n=n, error=error, p1=p1, mu=mu, sd=sd, alpha_vec=alpha_vec, beta_1=beta_1[i],
+                       beta_vec=beta_vec, lambda=lambda, loopnum=loopnum)
+    result <- rbind(result,
+                    c(mean(output[,1]), # Mean exposure rate
+                      mean(output[,2]), # Mean event rate
+                      mean(output[,3])-beta_1[i], # Bias
+                      sd(output[,3]), # SD
+                      mean((output[,3]-beta_1[i])^2), # MSE
+                      sum(output[,6])/loopnum, # Type 1 error Cox/Power Cox
+                      sum(output[,7])/loopnum, # Type 1 error logistic (with time)/Power logistic (with time)
+                      sum(output[,8])/loopnum, # Type 1 error logistic (without time)/Power logistic (without time)
+                      sum(output[,9])/loopnum)) # Type 1 error logistic (with record length)/Power logistic (with record length)
+  }
+  colnames(result) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+  rownames(result) <- c("beta = 0", "beta = log(1.1)", "beta = log(1.15)", "beta = log(1.25)", "beta = log(1.5)", "beta = log(2)")
+  return(result)
+}
+```
+
+**No error**
+```{r error0-1, warning = FALSE, message = FALSE}
+# Results
+result0 <- read.csv('result01.csv', row.names=1)
+colnames(result0) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result0, digits = 4, main = "No Error")
+```
+
+```{r res_fig0-1}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result0[, "Type I Cox/Power Cox"]
+log_time <- result0[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result0[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result0[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res0_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title="No Error", color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23), legend.title = element_text(size=25), legend.text = element_text(size=25), legend.key.size = unit(4,"line")) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+leg <- get_legend(res0_fig)
+res0_fig_nl <- res0_fig + theme(legend.position = "none")
+  
+res0_fig_tab <- ggarrange(res0_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+```
+
+```{r warning = FALSE, message = FALSE}
+data <- survdata(seed=123, n=500, error=0, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+c(paste0("Complete Data,\nN = ", n[1]), paste0("Delayed Event Time \nCase 1, n = ", n[2]), paste0("Delayed Event Time \nCase 2, n = ", n[3]), paste0("Delayed Event Time \nCase 3, n = ", n[4]), paste0("Event Before EHR,\nn = ", n[5]))
+
+```
+
+**Error term is independent of the covariates**
+```{r error1-1, warning = FALSE, message = FALSE}
+# Results
+result1 <- read.csv('result11.csv', row.names=1)
+# output(seed=123, n=500, error=1, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=c(log(1),log(1.10),log(1.15),log(1.25),log(1.5),log(2)), beta_vec=c(log(2),log(2)), lambda=0.001, loopnum=5000)
+colnames(result1) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result1, digits = 4, main = "Error Independent")
+```
+
+```{r res_fig1-1}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result1[, "Type I Cox/Power Cox"]
+log_time <- result1[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result1[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result1[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res1_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title="Error Independent", color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+res1_fig_nl <- res1_fig + theme(legend.position = "none")
+  
+res1_fig_tab <- ggarrange(res1_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+```
+
+
+```{r warning = FALSE, message = FALSE}
+data <- survdata(seed=123, n=500, error=1, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+title <- c(paste0("Complete Data,\nN = ", n[1]), paste0("Delayed Event Time \nCase 1, n = ", n[2]), paste0("Delayed Event Time \nCase 2, n = ", n[3]), paste0("Delayed Event Time \nCase 3, n = ", n[4]), paste0("Event Before EHR,\nn = ", n[5]))
+
+hist_comp <- ggplot(data[[1]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[1], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hist_leg <- get_legend(hist_comp)
+hist_comp_nl <- hist_comp + theme(legend.position = "none")
+hist_1 <- ggplot(data[[2]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[2], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_2 <- ggplot(data[[3]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[3], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_3 <- ggplot(data[[4]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[4], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_4 <- ggplot(data[[5]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[5], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+
+
+#jpeg("hist1-1.jpeg", units="in", width=5, height=4, res=300)
+ggarrange(hist_comp_nl, hist_4, hist_leg, hist_1, hist_2, hist_3)
+#dev.off()
+```
+
+**Error term depends on the binary exposure $z$**
+```{r error2-1, warning = FALSE, message = FALSE}
+# Results
+result2 <- read.csv('result21.csv', row.names=1)
+colnames(result2) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result2, digits = 4, main = "Error Dependent on $z$ (Exposure)", escape=FALSE)
+```
+
+```{r res_fig2-1}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result2[, "Type I Cox/Power Cox"]
+log_time <- result2[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result2[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result2[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res2_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title="Error Dependent on Exposure, z", color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+res2_fig_nl <- res2_fig + theme(legend.position = "none")
+  
+res2_fig_tab <- ggarrange(res2_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+```
+
+```{r warning = FALSE, message = FALSE}
+data <- survdata(seed=123, n=500, error=2, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+title <- c(paste0("Complete Data,\nN = ", n[1]), paste0("Delayed Event Time \nCase 1, n = ", n[2]), paste0("Delayed Event Time \nCase 2, n = ", n[3]), paste0("Delayed Event Time \nCase 3, n = ", n[4]), paste0("Event Before EHR,\nn = ", n[5]))
+
+hist_comp <- ggplot(data[[1]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[1], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hist_leg <- get_legend(hist_comp)
+hist_comp_nl <- hist_comp + theme(legend.position = "none")
+hist_1 <- ggplot(data[[2]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[2], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_2 <- ggplot(data[[3]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[3], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_3 <- ggplot(data[[4]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[4], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_4 <- ggplot(data[[5]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[5], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+
+
+#jpeg("hist1-1.jpeg", units="in", width=5, height=4, res=300)
+ggarrange(hist_comp_nl, hist_4, hist_leg, hist_1, hist_2, hist_3)
+#dev.off()
+```
+
+**Error term depends on the binary covariate $x_1$ (confounder)**
+```{r error3-1, warning = FALSE, message = FALSE}
+# Results
+result3 <- read.csv('result31.csv', row.names=1)
+colnames(result3) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result3, digits = 4, main = "Error Dependent on $x_1$ (Confounder)", escape=FALSE)
+```
+
+```{r res_fig3-1}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result3[, "Type I Cox/Power Cox"]
+log_time <- result3[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result3[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result3[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res3_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title=expression(paste("Error Dependent on Confounder, ", x[1])), color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+res3_fig_nl <- res3_fig + theme(legend.position = "none")
+  
+res3_fig_tab <- ggarrange(res3_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+```
+
+```{r warning = FALSE, message = FALSE}
+data <- survdata(seed=123, n=500, error=3, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+title <- c(paste0("Complete Data,\nN = ", n[1]), paste0("Delayed Event Time \nCase 1, n = ", n[2]), paste0("Delayed Event Time \nCase 2, n = ", n[3]), paste0("Delayed Event Time \nCase 3, n = ", n[4]), paste0("Event Before EHR,\nn = ", n[5]))
+
+hist_comp <- ggplot(data[[1]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[1], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hist_leg <- get_legend(hist_comp)
+hist_comp_nl <- hist_comp + theme(legend.position = "none")
+hist_1 <- ggplot(data[[2]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[2], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_2 <- ggplot(data[[3]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[3], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_3 <- ggplot(data[[4]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[4], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_4 <- ggplot(data[[5]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[5], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+
+
+#jpeg("hist1-1.jpeg", units="in", width=5, height=4, res=300)
+ggarrange(hist_comp_nl, hist_4, hist_leg, hist_1, hist_2, hist_3)
+#dev.off()
+```
+
+**Error term depends on the continuous covariate $x_2$**
+```{r error4-1, warning = FALSE, message = FALSE}
+# Results
+result4 <- read.csv('result41.csv', row.names=1)
+colnames(result4) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result4, digits = 4, main = "Error Dependent on $x_2$", escape=FALSE)
+```
+
+```{r res_fig4-1}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result4[, "Type I Cox/Power Cox"]
+log_time <- result4[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result4[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result4[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res4_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title=expression(paste("Error Dependent on ", x[2])), color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+res4_fig_nl <- res4_fig + theme(legend.position = "none")
+  
+res4_fig_tab <- ggarrange(res4_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+```
+
+```{r warning = FALSE, message = FALSE}
+data <- survdata(seed=123, n=500, error=4, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+title <- c(paste0("Complete Data,\nN = ", n[1]), paste0("Delayed Event Time \nCase 1, n = ", n[2]), paste0("Delayed Event Time \nCase 2, n = ", n[3]), paste0("Delayed Event Time \nCase 3, n = ", n[4]), paste0("Event Before EHR,\nn = ", n[5]))
+
+hist_comp <- ggplot(data[[1]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[1], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hist_leg <- get_legend(hist_comp)
+hist_comp_nl <- hist_comp + theme(legend.position = "none")
+hist_1 <- ggplot(data[[2]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[2], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_2 <- ggplot(data[[3]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[3], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_3 <- ggplot(data[[4]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[4], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_4 <- ggplot(data[[5]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[5], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+
+
+#jpeg("hist1-1.jpeg", units="in", width=5, height=4, res=300)
+ggarrange(hist_comp_nl, hist_4, hist_leg, hist_1, hist_2, hist_3)
+#dev.off()
+```
+
+```{r res_fig1, fig.width=24, fig.height=18}
+# jpeg("res_sim1_exp_lt_l.jpeg", units="in", width=24, height=18, res=300)
+# leg <- get_legend(res_fig0)
+# res_fig0 <- res_fig0 + theme(legend.position = "none")
+# res_fig1 <- res_fig1 + theme(legend.position = "none")
+# res_fig2 <- res_fig2 + theme(legend.position = "none")
+# res_fig3 <- res_fig3 + theme(legend.position = "none")
+# res_fig4 <- res_fig4 + theme(legend.position = "none")
+ggarrange(res0_fig_tab, res1_fig_tab, res2_fig_tab, res3_fig_tab, res4_fig_tab, leg, nrow=2, ncol=3)
+# dev.off()
+```
+
+```{r}
+res_fig <- function(result0, result1, result2, result3, result4) {
+  #betas <- rep(c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), 4*5)
+  betas <- rep(c(1, 1.1, 1.15, 1.25, 1.5, 2), 4*5)
+  #betas <- rep(c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"), 4*5)
+  #betas <- factor(betas, levels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+  cox <- c(result0[, "Type I Cox/Power Cox"], result1[, "Type I Cox/Power Cox"], result2[, "Type I Cox/Power Cox"], result3[, "Type I Cox/Power Cox"], result4[, "Type I Cox/Power Cox"])
+  lrm_obs <- c(result0[, "Type I logistic (with time)/Power logistic (with time)"], result1[, "Type I logistic (with time)/Power logistic (with time)"], result2[, "Type I logistic (with time)/Power logistic (with time)"], result3[, "Type I logistic (with time)/Power logistic (with time)"], result4[, "Type I logistic (with time)/Power logistic (with time)"])
+  lrm_u <- c(result0[, "Type I logistic (without time)/Power logistic (without time)"], result1[, "Type I logistic (without time)/Power logistic (without time)"], result2[, "Type I logistic (without time)/Power logistic (without time)"], result3[, "Type I logistic (without time)/Power logistic (without time)"], result4[, "Type I logistic (without time)/Power logistic (without time)"])
+  lrm_rl <- c(result0[, "Type I logistic (with record length)/Power logistic (with record length)"], result1[, "Type I logistic (with record length)/Power logistic (with record length)"], result2[, "Type I logistic (with record length)/Power logistic (with record length)"], result3[, "Type I logistic (with record length)/Power logistic (with record length)"], result4[, "Type I logistic (with record length)/Power logistic (with record length)"])
+  eval <- c(cox, lrm_obs, lrm_u, lrm_rl)
+  lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+  lb <- ifelse(lb < 0, 0, lb)
+  ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+  ub <- ifelse(ub > 1, 1, ub)
+  Model <- c(rep("Cox", 6*5), rep("LRMobs", 6*5), rep("LRMu", 6*5), rep("LRMrl", 6*5))
+  Model <- factor(Model, levels=c("Cox", "LRMobs", "LRMu", "LRMrl"))
+  #det <- rep(c(rep("No delayed event time", 6), rep("Independent", 6), rep("Exposure", 6), rep("Confounder", 6), rep("Covariate", 6)), 4)
+  det <- rep(c(rep("Delayed event time: none", 6), rep("Delayed event time: independent", 6), rep("Delayed event time: exposure", 6), rep("Delayed event time: confounder", 6), rep("Delayed event time: covariate", 6)), 4)
+  #det <- factor(det, levels=c("No delayed event time", "Delayed event time is independent", "Delayed event time depends on exposure", "Delayed event time depends on confounder", "Delayed event time depends on covariate")) 
+  det <- factor(det, levels=c("Delayed event time: none", "Delayed event time: independent", "Delayed event time: exposure", "Delayed event time: confounder", "Delayed event time: covariate")) 
+  res_df <- data.frame(betas, eval, lb, ub, Model, det)
+
+  ggplot(res_df, aes(x=betas, y=eval, col=Model, group=Model)) +
+    geom_line() + geom_point(size=0.7) +
+    geom_errorbar(aes(ymin=lb, ymax=ub, width=0.035)) +
+    geom_hline(yintercept=0.05, linetype="dashed", color="black") +
+    facet_wrap(~ det) +
+    ylim(0,1) +
+    labs(x="Hazard Ratio for Exposure, z", y="Type I Error and Power *") + 
+    theme_bw() + 
+    theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=35, vjust=0.8, hjust=0.7, size=7), axis.text.y = element_text(size=9), axis.title.x = element_text(size=12), axis.title.y = element_text(size=12), title = element_text(size=23), legend.position=c(0.85, 0.18), legend.title = element_text(size=12), strip.text = element_text(size=11)) + scale_x_continuous(breaks=c(1, 1.1, 1.15, 1.25, 1.5, 2), labels=c("1", "1.1", "1.15", "1.25", "1.5", "2"))
+    
+    
+    #scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("1", "1.1", "1.15", "1.25", "1.5", "2"))
+  
+  # 1: angle=35, vjust=0.8, hjust=0.7, size=7; scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")); width=0.035
+  
+  # 2: angle=30, vjust=0.72, size=9; width = 0.3
+  
+  # 3: size=9, width=0.035
+}
+```
+
+```{r fig.width=9, fig.height=6}
+# tiff("res_sim1_exp_lt_l.tiff", units="in", width=9, height=6, res=300)
+#jpeg("res_sim1_exp_lt_l.jpeg", units="in", width=9, height=6, res=300)
+res_fig(result0, result1, result2, result3, result4)
+# dev.off()
+```
+
+```{r}
+res_fig_nocol <- function(result0, result1, result2, result3, result4) {
+  #betas <- rep(c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), 4*5)
+  betas <- rep(c(1, 1.1, 1.15, 1.25, 1.5, 2), 4*5)
+  #betas <- rep(c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"), 4*5)
+  #betas <- factor(betas, levels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+  cox <- c(result0[, "Type I Cox/Power Cox"], result1[, "Type I Cox/Power Cox"], result2[, "Type I Cox/Power Cox"], result3[, "Type I Cox/Power Cox"], result4[, "Type I Cox/Power Cox"])
+  lrm_obs <- c(result0[, "Type I logistic (with time)/Power logistic (with time)"], result1[, "Type I logistic (with time)/Power logistic (with time)"], result2[, "Type I logistic (with time)/Power logistic (with time)"], result3[, "Type I logistic (with time)/Power logistic (with time)"], result4[, "Type I logistic (with time)/Power logistic (with time)"])
+  lrm_u <- c(result0[, "Type I logistic (without time)/Power logistic (without time)"], result1[, "Type I logistic (without time)/Power logistic (without time)"], result2[, "Type I logistic (without time)/Power logistic (without time)"], result3[, "Type I logistic (without time)/Power logistic (without time)"], result4[, "Type I logistic (without time)/Power logistic (without time)"])
+  lrm_rl <- c(result0[, "Type I logistic (with record length)/Power logistic (with record length)"], result1[, "Type I logistic (with record length)/Power logistic (with record length)"], result2[, "Type I logistic (with record length)/Power logistic (with record length)"], result3[, "Type I logistic (with record length)/Power logistic (with record length)"], result4[, "Type I logistic (with record length)/Power logistic (with record length)"])
+  eval <- c(cox, lrm_obs, lrm_u, lrm_rl)
+  lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+  lb <- ifelse(lb < 0, 0, lb)
+  ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+  ub <- ifelse(ub > 1, 1, ub)
+  Model <- c(rep("Cox", 6*5), rep("LRMobs", 6*5), rep("LRMu", 6*5), rep("LRMrl", 6*5))
+  Model <- factor(Model, levels=c("Cox", "LRMobs", "LRMu", "LRMrl"))
+  #det <- rep(c(rep("No delayed event time", 6), rep("Independent", 6), rep("Exposure", 6), rep("Confounder", 6), rep("Covariate", 6)), 4)
+  det <- rep(c(rep("Delayed event time: none", 6), rep("Delayed event time: independent", 6), rep("Delayed event time: exposure", 6), rep("Delayed event time: confounder", 6), rep("Delayed event time: covariate", 6)), 4)
+  #det <- factor(det, levels=c("No delayed event time", "Delayed event time is independent", "Delayed event time depends on exposure", "Delayed event time depends on confounder", "Delayed event time depends on covariate")) 
+  det <- factor(det, levels=c("Delayed event time: none", "Delayed event time: independent", "Delayed event time: exposure", "Delayed event time: confounder", "Delayed event time: covariate")) 
+  res_df <- data.frame(betas, eval, lb, ub, Model, det)
+
+  #ggplot(res_df, aes(x=betas, y=eval, linetype=Model, shape=Model, group=Model)) +
+  ggplot(res_df, aes(x=betas, y=eval, linetype=Model, group=Model)) +
+    #geom_line(size=0.4) + geom_point(size=1) +
+    geom_line(size=0.4) + geom_point(size=0.7) +
+    geom_errorbar(aes(ymin=lb, ymax=ub, width=0.035), linetype=1) +
+    geom_hline(yintercept=0.05, linetype="dashed", color="grey") +
+    scale_linetype_manual(values=c(4,1,5,3)) +
+    #scale_shape_manual(values=c(15,17,16,18)) +
+    facet_wrap(~ det) +
+    ylim(0,1) +
+    labs(x="Hazard Ratio for Exposure, z", y="Type I Error and Power *") + 
+    theme_bw() + 
+    theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=35, vjust=0.8, hjust=0.7, size=7), axis.text.y = element_text(size=9), axis.title.x = element_text(size=12), axis.title.y = element_text(size=12), title = element_text(size=23), legend.position=c(0.85, 0.18), legend.key.size = unit(1, 'cm'), legend.title = element_text(size=12), strip.text = element_text(size=11)) + scale_x_continuous(breaks=c(1, 1.1, 1.15, 1.25, 1.5, 2), labels=c("1", "1.1", "1.15", "1.25", "1.5", "2"))
+    
+    
+    #scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("1", "1.1", "1.15", "1.25", "1.5", "2"))
+  
+  # 1: angle=35, vjust=0.8, hjust=0.7, size=7; scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")); width=0.035
+  
+  # 2: angle=30, vjust=0.72, size=9; width = 0.3
+  
+  # 3: size=9, width=0.035
+}
+```
+
+```{r fig.width=9, fig.height=6}
+# tiff("res_sim1_exp_lt_l.tiff", units="in", width=9, height=6, res=300)
+#jpeg("res_sim1_exp_lt_l.jpeg", units="in", width=9, height=6, res=300)
+res_fig_nocol(result0, result1, result2, result3, result4)
+#dev.off()
+```
+
+```{r eval=FALSE, echo=FALSE}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result1[, "Type I Cox/Power Cox"]
+log_time <- result1[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result1[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result1[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res1_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title="Error Independent", color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=7), axis.text.y = element_text(size=7), axis.title.x = element_text(size=10), axis.title.y = element_text(size=10), title = element_text(size=12)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+
+# jpeg("explain_sim_res.jpeg", units="in", width=6, height=4, res=300)
+# res1_fig
+# dev.off()
+```
+
+```{r eval=FALSE, echo=FALSE}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result2[, "Type I Cox/Power Cox"]
+log_time <- result2[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result2[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result2[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res2_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title="Error Dependent on Exposure, z", color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=7), axis.text.y = element_text(size=7), axis.title.x = element_text(size=10), axis.title.y = element_text(size=10), title = element_text(size=12)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+
+#jpeg("exp_lt_large_res2.jpeg", units="in", width=6, height=4, res=300)
+res2_fig
+#dev.off()
+```
+
+```{r fig.width=7, fig.height=4, warning=FALSE, message=FALSE, eval=FALSE}
+# Bias graph
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 5)
+bias <- c(result0[, "Bias"], result1[, "Bias"], result2[, "Bias"], result3[, "Bias"], result4[, "Bias"])
+sd_bias <- c(result0[, "SD"], result1[, "SD"], result2[, "SD"], result3[, "SD"], result4[, "SD"])
+error <- factor(c(rep("None", 6), rep("Independent", 6), rep("Exposure", 6), rep("Confounder", 6), rep("Covariate", 6)), levels=c("None", "Independent", "Exposure", "Confounder", "Covariate"))
+lb <- bias - sd_bias
+ub <- bias + sd_bias
+bias_df <- data.frame(betas, bias, error, lb, ub)
+
+bias_tab_df <- data.frame(rbind(t(round(bias[1:6],4)), t(round(bias[7:12],4)), t(round(bias[13:18],4)), t(round(bias[19:24],4)), t(round(bias[25:30],4))))
+rownames(bias_tab_df) <- c("None", "Independent", "Exposure", "Confounder", "Covariate")
+colnames(bias_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+bias_tab <- tableGrob(bias_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#E76BF3", "#00B0F6","#00BF7D", "#F8766D", "#A3A500"))), rowhead=list(fg_params=list(fontface="plain")), base_size=10))
+
+bias_fig <- ggplot(bias_df, aes(x=betas, y=bias, col=error)) + geom_point(position=position_dodge(0.04)) + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.1), position=position_dodge(0.04)) + geom_hline(yintercept=0, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Bias", title="Bias +/- Empirical Standard Deviation of Beta Coefficient for Exposure, z, from Model 1 (Cox)", color="Error") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72)) + scale_x_continuous(breaks=c(1, 2, 3, 4, 5, 6), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+
+bias_fig_nl <- bias_fig + theme(legend.position = "none")
+bias_fig_tab <- ggarrange(bias_fig_nl, bias_tab, nrow=2, heights=c(2,1)) 
+
+#jpeg("bias_sim1_exp_lt_l.jpeg", units="in", width=7, height=4, res=300)
+bias_fig
+#dev.off()
+```
+
+```{r}
+result0_exp_l_lt <- result0
+result1_exp_l_lt <- result1
+result2_exp_l_lt <- result2
+result3_exp_l_lt <- result3
+result4_exp_l_lt <- result4
+```
+
+```{r warning = FALSE, message = FALSE}
+
+CaseCount <- function(error=error, beta1=beta) {
+  data <- survdata(seed=123, n=500, error=error, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=beta1, beta_vec=c(log(2),log(2)), lambda=0.001)
+  n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+  Number <- c(paste0("Error=", error, "n"), paste0("Complete Data, N = ", n[1]), paste0("\n Delayed Event Time Case 1, n = ", n[2]), paste0("\n Delayed Event Time Case 2, n = ", n[3]), paste0("\n Delayed Event Time Case 3, n = ", n[4]), paste0("\n Event Before EHR, n = ", n[5]))
+  Rate <- c(paste0(round(n[5]/n[1],4),"Removed \n"), paste0(round(n[3]/(n[1]-n[5]),4), "misclassified \n"))
+  
+  cat(Rate)
+}  
+
+CaseCount(error=0, beta1=log(1))
+CaseCount(error=0, beta1=log(1.1))
+CaseCount(error=0, beta1=log(1.15))
+CaseCount(error=0, beta1=log(1.25))
+CaseCount(error=0, beta1=log(1.5))
+CaseCount(error=0, beta1=log(2))
+
+CaseCount(error=1, beta1=log(1))
+CaseCount(error=1, beta1=log(1.1))
+CaseCount(error=1, beta1=log(1.15))
+CaseCount(error=1, beta1=log(1.25))
+CaseCount(error=1, beta1=log(1.5))
+CaseCount(error=1, beta1=log(2))
+
+CaseCount(error=2, beta1=log(1))
+CaseCount(error=2, beta1=log(1.1))
+CaseCount(error=2, beta1=log(1.15))
+CaseCount(error=2, beta1=log(1.25))
+CaseCount(error=2, beta1=log(1.5))
+CaseCount(error=2, beta1=log(2))
+
+CaseCount(error=3, beta1=log(1))
+CaseCount(error=3, beta1=log(1.1))
+CaseCount(error=3, beta1=log(1.15))
+CaseCount(error=3, beta1=log(1.25))
+CaseCount(error=3, beta1=log(1.5))
+CaseCount(error=3, beta1=log(2))
+
+CaseCount(error=4, beta1=log(1))
+CaseCount(error=4, beta1=log(1.1))
+CaseCount(error=4, beta1=log(1.15))
+CaseCount(error=4, beta1=log(1.25))
+CaseCount(error=4, beta1=log(1.5))
+CaseCount(error=4, beta1=log(2))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+### Simulation 1 - Exponential, small
+
+**Functions**
+
+* The event time is simulated from an Exponential distribution
+* The parameters lead to a small number of observations in Error Case 2
+
+```{r functions-2, warning = FALSE, message = FALSE}
+# Generate data
+survdata <- function(seed, n, error, p1, mu, sd, alpha_vec, beta_1, beta_vec, lambda) {
+  set.seed(seed) # Set seed
+  
+  x1 <- rbern(n, p1) # Generate x1 (confounder)
+  x2 <- rnorm(n, mu, sd) # Generate x2
+  z <- rbern(n, 1/(1 + exp(-alpha_vec[1] - alpha_vec[2]*x1))) # Generate z (exposure)
+  
+  # Generate error term for five scenarios
+    # No error
+  if (error == 0 | error == "none") {
+    error_time <- rep(0, n)
+    # Error independent
+  } else if (error == 1 | error == "ind") {
+    error_time <- runif(n, min = 20, max = 40)
+    # Error depends on z
+  } else if (error == 2 | error == "z") {
+    error_time <- ifelse(z == 1, runif(n, min = 20, max = 40), runif(n, min = 40, max = 60))
+    # Error depends on x1 (confounder)
+  } else if (error == 3 | error == "x1") {
+    error_time <- ifelse(x1 == 1, runif(n, min = 20, max = 40), runif(n, min = 40, max = 60))
+    # Error depends on x2
+  } else if (error == 4 | error == "x2") {
+    error_time <- rlnorm(n, meanlog = 5*x2, sdlog = 1)
+    # Invalid input
+  } else {
+    print("Invalid input for err")
+  }
+  
+  time_left_trunc <- runif(n, min = 50, max = 150)   # Left truncation time 
+  time_event_pre <- (-log(runif(n, min = 0, max = 1)))*exp(-beta_1*z - beta_vec[1]*x1 - beta_vec[2]*x2)/lambda # Simulated event time from Cox-Exp
+  time_error_pre <- time_event_pre + error_time # Add simulated error time to original time
+  time_censor <- runif(n, min = 160, max = 260) # Censoring time
+  # time_censor <- runif(n, min = 430, max = 500) # Censoring time
+ 
+  data <- data.frame(cbind(x1, x2, z, time_left_trunc, time_event_pre, time_error_pre, time_censor))  
+  
+  # data$event <- ifelse(data$time_event_pre > data$time_censor | data$time_event_pre < data$time_left_trunc, 0, 1) # Event indicator for original time
+  # data$time_event <- ifelse(data$event == 1, data$time_event_pre, data$time_censor) # Actual time with event
+  # data$event_error <- ifelse(data$time_error_pre > data$time_censor | data$time_error_pre < data$time_left_trunc, 0, 1) # Event indicator for original + error time
+  # data$time_error <- ifelse(data$event_error == 1, data$time_error_pre, data$time_censor) # Actual time with event + error
+  
+  data$event <- ifelse(data$time_event_pre <= data$time_censor, 1, 0) # Event indicator for original time
+  data$time_event <- ifelse(data$event == 1, data$time_event_pre, data$time_censor) # Actual time with event
+  data$event_error <- ifelse(data$time_error_pre <= data$time_censor, 1, 0) # Event indicator for original + error time
+  data$time_error <- ifelse(data$event_error == 1, data$time_error_pre, data$time_censor) # Actual time with event + error
+  
+  # Drop observations with left truncation time greater than observed time
+  error_case4 <- data %>% filter(time_error < time_left_trunc)
+  data <- data[data$time_left_trunc < data$time_error, ]
+ 
+  data$time_diff <- data$time_error - data$time_left_trunc
+  data$rec_len <- data$time_censor - data$time_left_trunc
+  
+  # Get data from the different scenarios of error
+  error_case1 <- data %>% filter(event_error == 0) %>% filter(time_censor < time_event_pre)
+  error_case2 <- data %>% filter(event_error == 0) %>% filter(time_event_pre < time_censor & time_censor < time_error_pre)
+  error_case3 <- data %>% filter(event_error == 1) %>% filter(time_censor > time_error_pre)
+  
+  data.list <- list(data, error_case1, error_case2, error_case3, error_case4)
+  return(data.list)
+}
+
+# debugonce(survdata); survdata(seed=123, n=500, error=0, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+# Fit Coxph and logistic models on data
+models <- function(data.list){
+  data <- data.list[[1]]
+  # Coxph model
+  m1 <- coxph(Surv(time_left_trunc, time_error, event_error) ~ z + x1 + x2, data = data, timefix = FALSE) # Fit cox model
+  a <- summary(m1) # Model summary
+  
+  reject1 <- ifelse(a$coefficients["z", "Pr(>|z|)"] < 0.05, 1, 0) # Reject p-value
+  beta_est <- a$coefficients["z","coef"] # Beta estimate for z
+  CI_lw <- log(a$conf.int["z", "lower .95"]) # Lower bound of CI for beta for z
+  CI_up <- log(a$conf.int["z", "upper .95"]) # Upper bound of CI for beta for z
+
+   # logistic model adjusting for time
+  m2 <- glm(event_error ~ z + x1 + x2 + ns(time_diff, df=3), data = data, family = binomial()) # Fit logistic model
+  b <- summary(m2) # Model summary
+  reject2 <- ifelse(b$coefficients["z","Pr(>|z|)"] < 0.05, 1, 0) # Reject p-value
+  
+  # logistic model without time
+  m3 <- glm(event_error ~ z + x1 + x2, data = data, family = binomial()) # Fit logistic model
+  c <- summary(m3) # Model summary
+  reject3 <- ifelse(c$coefficients["z","Pr(>|z|)"] < 0.05, 1, 0) # Reject p-value
+  
+  # logistic model adjusting for record length
+  m4 <- glm(event_error ~ z + x1 + x2 + rec_len + ns(time_censor, df=3), data = data, family = binomial()) # Fit logistic model
+  d <- summary(m4) # Model summary
+  reject4 <- ifelse(d$coefficients["z","Pr(>|z|)"] < 0.05, 1, 0) # Reject p-value
+  
+  event_rate <- sum(data$event)/dim(data)[1] # Event rate
+  mean_z <- mean(data$z) # Mean exposure
+  result <- c(mean_z, event_rate, beta_est, CI_lw, CI_up, reject1, reject2, reject3, reject4) # Results
+  return(result)
+}
+
+# Loop
+meanloop <- function(seed, n, error, p1, mu, sd, alpha_vec, beta_1, beta_vec, lambda, loopnum) {
+  results_all <- matrix(NA, loopnum, 9) # Initialize 
+  # Generate data and store results loopnum times
+  for (i in 1:loopnum) {
+    data.list <- survdata(seed + i, n, error, p1, mu, sd, alpha_vec, beta_1, beta_vec, lambda)
+    results_all[i, ] <- models(data.list)
+  }
+  return(results_all)
+}
+
+# Output
+output <- function(seed, n, error, p1, mu, sd, alpha_vec, beta_1, beta_vec, lambda, loopnum) {
+  result <- matrix(NA, 0, 9)
+  for (i in seq_along(beta_1)) {
+    output <- meanloop(seed=seed, n=n, error=error, p1=p1, mu=mu, sd=sd, alpha_vec=alpha_vec, beta_1=beta_1[i],
+                       beta_vec=beta_vec, lambda=lambda, loopnum=loopnum)
+    result <- rbind(result,
+                    c(mean(output[,1]), # Mean exposure rate
+                      mean(output[,2]), # Mean event rate
+                      mean(output[,3])-beta_1[i], # Bias
+                      sd(output[,3]), # SD
+                      mean((output[,3]-beta_1[i])^2), # MSE
+                      sum(output[,6])/loopnum, # Type 1 error Cox/Power Cox
+                      sum(output[,7])/loopnum, # Type 1 error logistic (with time)/Power logistic (with time)
+                      sum(output[,8])/loopnum, # Type 1 error logistic (without time)/Power logistic (without time)
+                      sum(output[,9])/loopnum)) # Type 1 error logistic (with record length)/Power logistic (with record length)
+  }
+  colnames(result) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+  rownames(result) <- c("beta = 0", "beta = log(1.1)", "beta = log(1.15)", "beta = log(1.25)", "beta = log(1.5)", "beta = log(2)")
+  return(result)
+}
+```
+
+```{r error0-2-run, warning = FALSE, message = FALSE, eval=rerun}
+# Results
+result <- output(seed=123, n=500, error=0, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=c(log(1),log(1.10),log(1.15),log(1.25),log(1.5),log(2)), beta_vec=c(log(2),log(2)), lambda=0.001, loopnum=5000)
+write.csv(result, file='result02.csv')
+
+result <- output(seed=123, n=500, error=1, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=c(log(1),log(1.10),log(1.15),log(1.25),log(1.5),log(2)), beta_vec=c(log(2),log(2)), lambda=0.001, loopnum=5000)
+save.csv(result, file='result12.csv')
+
+result <- output(seed=123, n=500, error=2, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=c(log(1),log(1.10),log(1.15),log(1.25),log(1.5),log(2)), beta_vec=c(log(2),log(2)), lambda=0.001, loopnum=5000)
+save.csv(result, file='result22.csv')
+
+result <- output(seed=123, n=500, error=3, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=c(log(1),log(1.10),log(1.15),log(1.25),log(1.5),log(2)), beta_vec=c(log(2),log(2)), lambda=0.001, loopnum=5000)
+save.csv(result, file='result32.csv')
+
+result <- output(seed=123, n=500, error=4, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=c(log(1),log(1.10),log(1.15),log(1.25),log(1.5),log(2)), beta_vec=c(log(2),log(2)), lambda=0.001, loopnum=5000)
+save.csv(result, file='result42.csv')
+
+result <- output(seed=123, n=500, error=5, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=c(log(1),log(1.10),log(1.15),log(1.25),log(1.5),log(2)), beta_vec=c(log(2),log(2)), lambda=0.001, loopnum=5000)
+save.csv(result, file='result52.csv')
+
+```
+
+**No error**
+```{r error0-2, warning = FALSE, message = FALSE}
+result0 <- read.csv('result02.csv', row.names=1)
+colnames(result0) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result0, digits = 4, main = "No Error")
+```
+
+```{r res_fig0-2}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result0[, "Type I Cox/Power Cox"]
+log_time <- result0[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result0[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result0[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res0_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title="No Error", color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23), legend.title = element_text(size=25), legend.text = element_text(size=25), legend.key.size = unit(4,"line")) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+leg <- get_legend(res0_fig)
+res0_fig_nl <- res0_fig + theme(legend.position = "none")
+  
+res0_fig_tab <- ggarrange(res0_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+
+res0_fig_tab
+```
+
+**Error term is independent of the covariates**
+```{r error1-2, warning = FALSE, message = FALSE}
+# Results
+result1 <- read.csv('result12.csv', row.names=1)
+colnames(result1) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result1, digits = 4, main = "Error Independent")
+```
+
+```{r res_fig1-2}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result1[, "Type I Cox/Power Cox"]
+log_time <- result1[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result1[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result1[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res1_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title="Error Independent", color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+res1_fig_nl <- res1_fig + theme(legend.position = "none")
+  
+res1_fig_tab <- ggarrange(res1_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+```
+
+```{r warning = FALSE, message = FALSE}
+data <- survdata(seed=123, n=500, error=1, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+title <- c(paste0("Complete Data,\nN = ", n[1]), paste0("Delayed Event Time \nCase 1, n = ", n[2]), paste0("Delayed Event Time \nCase 2, n = ", n[3]), paste0("Delayed Event Time \nCase 3, n = ", n[4]), paste0("Event Before EHR,\nn = ", n[5]))
+
+hist_comp <- ggplot(data[[1]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[1], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hist_leg <- get_legend(hist_comp)
+hist_comp_nl <- hist_comp + theme(legend.position = "none")
+hist_1 <- ggplot(data[[2]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[2], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_2 <- ggplot(data[[3]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[3], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_3 <- ggplot(data[[4]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[4], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_4 <- ggplot(data[[5]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[5], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+
+
+#jpeg("hist1-1.jpeg", units="in", width=5, height=4, res=300)
+ggarrange(hist_comp_nl, hist_4, hist_leg, hist_1, hist_2, hist_3)
+#dev.off()
+```
+
+**Error term depends on the binary exposure $z$**
+```{r error2-2, warning = FALSE, message = FALSE}
+# Results
+result2 <- read.csv('result22.csv', row.names=1)
+colnames(result2) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result2, digits = 4, main = "Error Dependent on $z$ (Exposure)", escape=FALSE)
+```
+
+```{r res_fig2-2}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result2[, "Type I Cox/Power Cox"]
+log_time <- result2[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result2[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result2[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res2_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title="Error Dependent on Exposure, z", color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+res2_fig_nl <- res2_fig + theme(legend.position = "none")
+  
+res2_fig_tab <- ggarrange(res2_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+```
+
+```{r warning = FALSE, message = FALSE}
+data <- survdata(seed=123, n=500, error=2, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+title <- c(paste0("Complete Data,\nN = ", n[1]), paste0("Delayed Event Time \nCase 1, n = ", n[2]), paste0("Delayed Event Time \nCase 2, n = ", n[3]), paste0("Delayed Event Time \nCase 3, n = ", n[4]), paste0("Event Before EHR,\nn = ", n[5]))
+
+hist_comp <- ggplot(data[[1]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[1], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hist_leg <- get_legend(hist_comp)
+hist_comp_nl <- hist_comp + theme(legend.position = "none")
+hist_1 <- ggplot(data[[2]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[2], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_2 <- ggplot(data[[3]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[3], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_3 <- ggplot(data[[4]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[4], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_4 <- ggplot(data[[5]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[5], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+
+
+#jpeg("hist1-1.jpeg", units="in", width=5, height=4, res=300)
+ggarrange(hist_comp_nl, hist_4, hist_leg, hist_1, hist_2, hist_3)
+#dev.off()
+```
+
+**Error term depends on the binary covariate $x_1$ (confounder)**
+```{r error3-2, warning = FALSE, message = FALSE}
+# Results
+result3 <- read.csv('result32.csv', row.names=1)
+colnames(result3) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result3, digits = 4, main = "Error Dependent on $x_1$ (Confounder)", escape=FALSE)
+```
+
+```{r res_fig3-2}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result3[, "Type I Cox/Power Cox"]
+log_time <- result3[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result3[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result3[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res3_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title=expression(paste("Error Dependent on Confounder, ", x[1])), color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+res3_fig_nl <- res3_fig + theme(legend.position = "none")
+  
+res3_fig_tab <- ggarrange(res3_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+```
+
+```{r warning = FALSE, message = FALSE}
+data <- survdata(seed=123, n=500, error=3, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+title <- c(paste0("Complete Data,\nN = ", n[1]), paste0("Delayed Event Time \nCase 1, n = ", n[2]), paste0("Delayed Event Time \nCase 2, n = ", n[3]), paste0("Delayed Event Time \nCase 3, n = ", n[4]), paste0("Event Before EHR,\nn = ", n[5]))
+
+hist_comp <- ggplot(data[[1]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[1], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hist_leg <- get_legend(hist_comp)
+hist_comp_nl <- hist_comp + theme(legend.position = "none")
+hist_1 <- ggplot(data[[2]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[2], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_2 <- ggplot(data[[3]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[3], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_3 <- ggplot(data[[4]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[4], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_4 <- ggplot(data[[5]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[5], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+
+
+#jpeg("hist1-1.jpeg", units="in", width=5, height=4, res=300)
+ggarrange(hist_comp_nl, hist_4, hist_leg, hist_1, hist_2, hist_3)
+#dev.off()
+```
+
+**Error term depends on the continuous covariate $x_2$**
+```{r error4-2, warning = FALSE, message = FALSE}
+# Results
+result4 <- read.csv('result42.csv', row.names=1)
+colnames(result4) <- c("Mean Exposure Rate", "Mean Event Rate", "Bias", "SD", "MSE", "Type I Cox/Power Cox", "Type I logistic (with time)/Power logistic (with time)", "Type I logistic (without time)/Power logistic (without time)", "Type I logistic (with record length)/Power logistic (with record length)")
+kable(result4, digits = 4, main = "Error Dependent on $x_2$", escape=FALSE)
+```
+
+```{r res_fig4-2}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result4[, "Type I Cox/Power Cox"]
+log_time <- result4[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result4[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result4[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res4_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title=expression(paste("Error Dependent on ", x[2])), color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=15), axis.text.y = element_text(size=15), axis.title.x = element_text(size=20), axis.title.y = element_text(size=20), title = element_text(size=23)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+res4_fig_nl <- res4_fig + theme(legend.position = "none")
+  
+res4_fig_tab <- ggarrange(res4_fig_nl, res_tab, nrow=2, heights=c(2.4,1)) 
+```
+
+```{r warning = FALSE, message = FALSE}
+data <- survdata(seed=123, n=500, error=4, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+title <- c(paste0("Complete Data,\nN = ", n[1]), paste0("Delayed Event Time \nCase 1, n = ", n[2]), paste0("Delayed Event Time \nCase 2, n = ", n[3]), paste0("Delayed Event Time \nCase 3, n = ", n[4]), paste0("Event Before EHR,\nn = ", n[5]))
+
+hist_comp <- ggplot(data[[1]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[1], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hist_leg <- get_legend(hist_comp)
+hist_comp_nl <- hist_comp + theme(legend.position = "none")
+hist_1 <- ggplot(data[[2]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[2], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_2 <- ggplot(data[[3]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[3], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_3 <- ggplot(data[[4]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[4], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+hist_4 <- ggplot(data[[5]]) + geom_histogram(aes(time_event, fill="True Time"), alpha=0.7) + geom_histogram(aes(time_error, fill="Delayed Event Time"), alpha=0.7) + xlim(0,500) + labs(title=title[5], x="Time", y="Frequency", fill="Legend") + scale_color_manual(values=colors) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
+
+
+#jpeg("hist1-1.jpeg", units="in", width=5, height=4, res=300)
+ggarrange(hist_comp_nl, hist_4, hist_leg, hist_1, hist_2, hist_3)
+#dev.off()
+```
+
+```{r res_fig2, fig.width=24, fig.height=18}
+#jpeg("res_sim1_exp_lt_s.jpeg", units="in", width=24, height=18, res=300)
+# leg <- get_legend(res_fig0)
+# res_fig0 <- res_fig0 + theme(legend.position = "none")
+# res_fig1 <- res_fig1 + theme(legend.position = "none")
+# res_fig2 <- res_fig2 + theme(legend.position = "none")
+# res_fig3 <- res_fig3 + theme(legend.position = "none")
+# res_fig4 <- res_fig4 + theme(legend.position = "none")
+ggarrange(res0_fig_tab, res1_fig_tab, res2_fig_tab, res3_fig_tab, res4_fig_tab, leg, nrow=2, ncol=3)
+#dev.off()
+```
+
+```{r eval=FALSE, echo=FALSE}
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 4)
+cox <- result2[, "Type I Cox/Power Cox"]
+log_time <- result2[, "Type I logistic (with time)/Power logistic (with time)"]
+log_wotime <- result2[, "Type I logistic (without time)/Power logistic (without time)"]
+log_reclen <- result2[, "Type I logistic (with record length)/Power logistic (with record length)"]
+eval <- c(cox, log_time, log_wotime, log_reclen)
+lb <- eval - qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+lb <- ifelse(lb < 0, 0, lb)
+ub <- eval + qnorm(0.975)*sqrt((eval*(1-eval))/5000)
+ub <- ifelse(ub > 1, 1, ub)
+mod <- c(rep("Cox", 6), rep("LRM1", 6), rep("LRM2", 6), rep("LRM3", 6))
+mod <- factor(mod, levels=c("Cox", "LRM1", "LRM2", "LRM3"))
+res_df <- data.frame(betas, eval, lb, ub, mod)
+
+res_tab_df <- data.frame(rbind(t(round(eval[1:6],3)), t(round(eval[7:12],3)), t(round(eval[13:18],3)), t(round(eval[19:24],3))))
+rownames(res_tab_df) <- c("Cox", "LRM1", "LRM2", "LRM3")
+colnames(res_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+res_tab <- tableGrob(res_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#F8766D", "#7CAE00","#00BFC4", "#C77CFF"))), rowhead=list(fg_params=list(fontface="plain")), base_size=19))
+
+res2_fig <- ggplot(res_df, aes(x=betas, y=eval, col=mod)) + geom_line() + geom_point() + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03)) + geom_hline(yintercept=0.05, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Type I Error/Power", title="Error Dependent on Exposure, z", color="Model") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72, size=7), axis.text.y = element_text(size=7), axis.title.x = element_text(size=10), axis.title.y = element_text(size=10), title = element_text(size=12)) + scale_x_continuous(breaks=c(log(1), log(1.1), log(1.15), log(1.25), log(1.5), log(2)), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+
+#jpeg("exp_lt_small_res2.jpeg", units="in", width=6, height=4, res=300)
+res2_fig
+#dev.off()
+```
+
+```{r fig.width=9, fig.height=6}
+# tiff("res_sim1_exp_lt_s.tiff", units="in", width=9, height=6, res=300)
+#jpeg("res_sim1_exp_lt_s.jpeg", units="in", width=9, height=6, res=300)
+res_fig(result0, result1, result2, result3, result4)
+#dev.off()
+```
+
+```{r fig.width=7, fig.height=4, warning=FALSE, message=FALSE, eval=FALSE}
+# Bias graph
+betas <- rep(c(log(1), log(1.10), log(1.15), log(1.25), log(1.5), log(2)), 5)
+bias <- c(result0[, "Bias"], result1[, "Bias"], result2[, "Bias"], result3[, "Bias"], result4[, "Bias"])
+sd_bias <- c(result0[, "SD"], result1[, "SD"], result2[, "SD"], result3[, "SD"], result4[, "SD"])
+error <- factor(c(rep("None", 6), rep("Independent", 6), rep("Exposure", 6), rep("Confounder", 6), rep("Covariate", 6)), levels=c("None", "Independent", "Exposure", "Confounder", "Covariate"))
+lb <- bias - sd_bias
+ub <- bias + sd_bias
+bias_df <- data.frame(betas, bias, error, lb, ub)
+
+bias_tab_df <- data.frame(rbind(t(round(bias[1:6],4)), t(round(bias[7:12],4)), t(round(bias[13:18],4)), t(round(bias[19:24],4)), t(round(bias[25:30],4))))
+rownames(bias_tab_df) <- c("None", "Independent", "Exposure", "Confounder", "Covariate")
+colnames(bias_tab_df) <- c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)")
+bias_tab <- tableGrob(bias_tab_df, theme = ttheme_minimal(core=list(fg_params=list(col=c("#E76BF3", "#00B0F6","#00BF7D", "#F8766D", "#A3A500"))), rowhead=list(fg_params=list(fontface="plain")), base_size=10))
+
+bias_fig <- ggplot(bias_df, aes(x=betas, y=bias, col=error)) + geom_point(position=position_dodge(0.04)) + geom_errorbar(aes(ymin=lb, ymax=ub, width=0.03), position=position_dodge(0.04)) + geom_hline(yintercept=0, linetype="dashed", color="black") + labs(x="Beta Coefficient for Exposure, z", y="Bias", title="Bias +/- Empirical Standard Deviation of Beta Coefficient for Exposure, z, from Model 1 (Cox)", color="Error") + theme_bw() + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_text(angle=30, vjust=0.72)) + scale_x_continuous(breaks=c(1, 2, 3, 4, 5, 6), labels=c("log(1)", "log(1.1)", "log(1.15)", "log(1.25)", "log(1.5)", "log(2)"))
+
+# bias_fig_nl <- bias_fig + theme(legend.position = "none")
+# bias_fig_tab <- ggarrange(bias_fig_nl, bias_tab, nrow=2, heights=c(2,1)) 
+
+#jpeg("bias_sim1_exp_lt_s.jpeg", units="in", width=7, height=4, res=300)
+# bias_fig_tab
+bias_fig
+#dev.off()
+```
+
+```{r eval=FALSE}
+# Plot results of original time and time with error
+sim0plot <- survdata(seed=123, n=1000000, error=0, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+# Plot results of original time and time with error
+sim1plot <- survdata(seed=123, n=1000000, error=1, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+# Plot results of original time and time with error
+sim2plot <- survdata(seed=123, n=1000000, error=2, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+# Plot results of original time and time with error
+sim3plot <- survdata(seed=123, n=1000000, error=3, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+
+# Plot results of original time and time with error
+sim4plot <- survdata(seed=123, n=1000000, error=4, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=log(2), beta_vec=c(log(2),log(2)), lambda=0.001)
+```
+
+```{r surv_fig2, fig.width=12, fig.height=8, cache = TRUE, eval=FALSE}
+#jpeg("surv_sim1_exp_lt_s.jpeg", units="in", width=12, height=8, res=300)
+par(mfrow=c(2,3))
+
+# surv0-2
+plot(survfit(Surv(time_event, event) ~ z, data=sim0plot[[1]]), lty=c(1,1), col=1:2, xlim=c(0,300), 
+     xlab="Time (days)", ylab="Survival Probability", main="Delayed event time: none", cex.main=1.8, cex.lab=1.5, cex.axis=1.2)
+
+# surv1-2
+plot(survfit(Surv(time_event, event) ~ z, data=sim1plot[[1]]), lty=c(1,1), col=1:2, xlim=c(0,300), 
+     xlab="Time (days)", ylab="Survival Probability", main="Delayed event time: independent", cex.main=1.8, cex.lab=1.5, cex.axis=1.2)
+lines(survfit(Surv(time_error, event_error) ~ z, data=sim1plot[[1]]), lty=c(1,1), col=3:4)
+
+# surv2-2
+plot(survfit(Surv(time_event, event) ~ z, data=sim2plot[[1]]), lty=c(1,1), col=1:2, xlim=c(0,300), 
+     xlab="Time (days)", ylab="Survival Probability", main="Delayed event time: exposure", cex.main=1.8, cex.lab=1.5, cex.axis=1.2)
+lines(survfit(Surv(time_error, event_error) ~ z, data=sim2plot[[1]]), lty=c(1,1), col=3:4)
+
+# surv3-2
+plot(survfit(Surv(time_event, event) ~ z, data=sim3plot[[1]]), lty=c(1,1), col=1:2, xlim=c(0,300), 
+     xlab="Time (days)", ylab="Survival Probability", main="Delayed event time: confounder", cex.main=1.8, cex.lab=1.5, cex.axis=1.2)
+lines(survfit(Surv(time_error, event_error) ~ z, data=sim3plot[[1]]), lty=c(1,1), col=3:4)
+
+# surv4-2
+plot(survfit(Surv(time_event, event) ~ z, data=sim4plot[[1]]), lty=c(1,1), col=1:2, xlim=c(0,300), 
+     xlab="Time (days)", ylab="Survival Probability", main="Delayed event time: covariate", cex.main=1.8, cex.lab=1.5, cex.axis=1.2)
+lines(survfit(Surv(time_error, event_error) ~ z, data=sim4plot[[1]]), lty=c(1,1), col=3:4)
+
+# legend
+plot(NULL, xaxt='n', yaxt='n', bty='n', ylab='', xlab='', xlim=0:1, ylim=0:1)
+legend("center", c("True time K-M S(t|Contr)", "True time K-M S(t|Exposed)", "Error time K-M S(t|Contr)", "Error time K-M S(t|Exposed)"), title="Legend",
+       lty=c(1,1,1,1), col=1:4, cex=1.6, bty="n")
+#dev.off()
+```
+
+```{r}
+result0_exp_s_lt <- result0
+result1_exp_s_lt <- result1
+result2_exp_s_lt <- result2
+result3_exp_s_lt <- result3
+result4_exp_s_lt <- result4
+```
+
+```{r warning = FALSE, message = FALSE}
+
+CaseCount <- function(error=error, beta1=beta) {
+  data <- survdata(seed=123, n=500, error=error, p1=0.3, mu=0.5, sd=0.4, alpha_vec=c(-1.25,1), beta_1=beta1, beta_vec=c(log(2),log(2)), lambda=0.001)
+  n <- c(dim(data[[1]])[1], dim(data[[2]])[1], dim(data[[3]])[1], dim(data[[4]])[1], dim(data[[5]])[1])
+  Number <- c(paste0("Error=", error, "n"), paste0("Complete Data, N = ", n[1]), paste0("\n Delayed Event Time Case 1, n = ", n[2]), paste0("\n Delayed Event Time Case 2, n = ", n[3]), paste0("\n Delayed Event Time Case 3, n = ", n[4]), paste0("\n Event Before EHR, n = ", n[5]))
+  Rate <- c(paste0(round(n[5]/n[1],4),"Removed \n"), paste0(round(n[3]/(n[1]-n[5]),4), "misclassified \n"))
+  
+  cat(Rate)
+}  
+
+CaseCount(error=0, beta1=log(1))
+CaseCount(error=0, beta1=log(1.1))
+CaseCount(error=0, beta1=log(1.15))
+CaseCount(error=0, beta1=log(1.25))
+CaseCount(error=0, beta1=log(1.5))
+CaseCount(error=0, beta1=log(2))
+
+CaseCount(error=1, beta1=log(1))
+CaseCount(error=1, beta1=log(1.1))
+CaseCount(error=1, beta1=log(1.15))
+CaseCount(error=1, beta1=log(1.25))
+CaseCount(error=1, beta1=log(1.5))
+CaseCount(error=1, beta1=log(2))
+
+CaseCount(error=2, beta1=log(1))
+CaseCount(error=2, beta1=log(1.1))
+CaseCount(error=2, beta1=log(1.15))
+CaseCount(error=2, beta1=log(1.25))
+CaseCount(error=2, beta1=log(1.5))
+CaseCount(error=2, beta1=log(2))
+
+CaseCount(error=3, beta1=log(1))
+CaseCount(error=3, beta1=log(1.1))
+CaseCount(error=3, beta1=log(1.15))
+CaseCount(error=3, beta1=log(1.25))
+CaseCount(error=3, beta1=log(1.5))
+CaseCount(error=3, beta1=log(2))
+
+CaseCount(error=4, beta1=log(1))
+CaseCount(error=4, beta1=log(1.1))
+CaseCount(error=4, beta1=log(1.15))
+CaseCount(error=4, beta1=log(1.25))
+CaseCount(error=4, beta1=log(1.5))
+CaseCount(error=4, beta1=log(2))
+
+```
+
+
+
+
+
+### Bias calculation for Cox Model 
+
+```{r}
+library(kableExtra)
+load("~/Documents/Vanderbilt/Masters/Final Simulation Results/result_l_bias_df.Rds")
+result_l_bias_df <- cbind(rep(c("No error", "Independent error", "Exposure-dependent error", "Confounder-dependent error", "Covariate-dependent error"), 12), result_l_bias_df)
+colnames(result_l_bias_df) <- c("", "beta = 0", "beta = log(1.1)", "beta = log(1.15)", "beta = log(1.25)", "beta = log(1.5)", "beta = log(2)")
+kable(result_l_bias_df) %>% kable_styling(full_width=TRUE) %>% 
+  pack_rows("Exponential, left truncation", 1, 5) %>% 
+  pack_rows("Log-normal, left truncation", 6, 10) %>% 
+  pack_rows("Censoring (x), left truncation", 11, 15) %>% 
+  pack_rows("Censoring (x & z), left truncation", 16, 20) %>% 
+  pack_rows("Exponential, no left truncation", 21, 25) %>% 
+  pack_rows("Log-normal, no left truncation", 26, 30) %>% 
+  pack_rows("Censoring (x), no left truncation", 31, 35) %>% 
+  pack_rows("Censoring (x & z), no left truncation", 36, 40) %>% 
+  pack_rows("Exponential, Simulation 2", 41, 45) %>% 
+  pack_rows("Log-normal, Simulation 2", 46, 50) %>% 
+  pack_rows("Censoring (x), Simulation 2", 51, 55) %>% 
+  pack_rows("Censoring (x & z), Simulation 2", 56, 60)
+```
