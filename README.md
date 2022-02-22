@@ -1,6 +1,6 @@
 This repository contains R codes for simulation studies and genomic study application in paper: https://academic.oup.com/bioinformatics/advance-article-abstract/doi/10.1093/bioinformatics/btac086/6528313
 
-Simulation codes in Simulations folder:
+Simulation codes in Simulations folder:\
   -- Code for Figure 1 and 2: Exponential_LT_Results (Drop Obs; Large).Rmd\
   -- Code for Figure S1 and S3: Censoring_LT_Results (Drop Obs; Large).Rmd\
   -- Code for Figure 3: Exponential_LT_Results (All Obs; Large).Rmd\
